@@ -27,6 +27,11 @@ import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:  # pragma: no cover - optional dependency at runtime.
+    SummaryWriter = None
+
 
 def init_logging():
     """Custom logging format for better readability."""
@@ -68,6 +73,24 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
+
+
+def init_tensorboard(config: _config.TrainConfig):
+    if not config.tensorboard_enabled:
+        return None
+    if SummaryWriter is None:
+        logging.warning(
+            "TensorBoard logging is enabled, but torch.utils.tensorboard.SummaryWriter is unavailable. "
+            "Skipping TensorBoard logging."
+        )
+        return None
+
+    log_dir = config.tensorboard_log_dir or str(config.checkpoint_dir / "tensorboard")
+    log_path = epath.Path(log_dir).expanduser()
+    log_path.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(log_path))
+    logging.info(f"TensorBoard logging enabled at: {log_path}")
+    return writer
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -216,6 +239,7 @@ def main(config: _config.TrainConfig):
         resume=config.resume,
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    tensorboard_writer = init_tensorboard(config)
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -226,12 +250,13 @@ def main(config: _config.TrainConfig):
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
-    # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    # Log images from first batch to sanity check when wandb is enabled.
+    if config.wandb_enabled:
+        images_to_log = [
+            wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+            for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        ]
+        wandb.log({"camera_views": images_to_log}, step=0)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
@@ -266,6 +291,9 @@ def main(config: _config.TrainConfig):
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
+            if tensorboard_writer is not None:
+                for key, value in reduced_info.items():
+                    tensorboard_writer.add_scalar(f"train/{key}", float(value), step)
             infos = []
         batch = next(data_iter)
 
@@ -274,6 +302,9 @@ def main(config: _config.TrainConfig):
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+    if tensorboard_writer is not None:
+        tensorboard_writer.flush()
+        tensorboard_writer.close()
 
 
 if __name__ == "__main__":
